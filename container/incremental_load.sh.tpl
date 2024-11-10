@@ -66,160 +66,43 @@ function join_by() {
   echo "$*"
 }
 
-function sequence_exists() {
-  local diff_ids="$@"
-  cat > config.json <<EOF
-{
-    "architecture": "amd64",
-    "author": "Bazel",
-    "config": {},
-    "created": "0001-01-01T00:00:00Z",
-    "history": [
-        {
-            "author": "Bazel",
-            "created": "0001-01-01T00:00:00Z",
-            "created_by": "bazel build ..."
-        }
-    ],
-    "os": "linux",
-    "rootfs": {
-        "diff_ids": [$(join_by , ${diff_ids[@]})],
-        "type": "layers"
-    }
-}
-EOF
-
-  cat > manifest.json <<EOF
-[{
-   "Config": "config.json",
-   "Layers": [$(join_by , ${diff_ids[@]})],
-   "RepoTags": []
-}]
-EOF
-
-  set -o pipefail
-  tar c config.json manifest.json | "${DOCKER}" ${DOCKER_FLAGS} load 2>/dev/null | cut -d':' -f 2- >> "${TEMP_IMAGES}"
-}
-
-function find_diffbase() {
-  local name="$1"
+function import_config() {
+  TAG="$1"
   shift
 
-  NEW_DIFF_IDS=()
-  while test $# -gt 0
-  do
-    local diff_id="$(cat "${RUNFILES}/$1")"
-    # Throwaway the layer, we only want diff id.
-    shift 2
+  local registry_output="$(mktemp)"
+  echo "${registry_output}" >> "${TEMP_FILES}"
+  "${RUNFILES}/%{registry_tool}" -- "${registry_output}" "image" "$@" &
+  local registry_pid=$!
 
-    NEW_DIFF_IDS+=("${diff_id}")
-  done
-
-
-  PYTHON="python"
-  if command -v python3 &>/dev/null; then
-      PYTHON="python3"
+  # If we can do that, symlinking the layer diff blobs into the containerd
+  # content dir is a way to skip downloading them, and then keeping the
+  # downloaded copy. After creating the snapshot of the image, we don't
+  # need the layer blobs anymore, but there's no way to prune the content
+  # store. As they aren't really needed, it's OK if the symlinks
+  # eventually dangle.
+  if [[ -w "/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256" ]]; then
+    shift
+    while test $# -gt 0
+    do
+      local diff_id="$(cat "${RUNFILES}/$1")"
+      local layer="${RUNFILES}/$2"
+      local layer_in_content_store="/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/${diff_id}"
+      if [[ ! -e "${layer_in_content_store}" ]]; then
+        if [[ -L "${layer_in_content_store}" ]]; then
+          rm "${layer_in_content_store}"
+        fi
+        ln -s "$(readlink -f "${layer}")" "${layer_in_content_store}"
+      fi
+    done
   fi
 
-  TOTAL_DIFF_IDS=($(cat "${name}" | $PYTHON -mjson.tool | \
-      grep -E '^ +"sha256:' | cut -d'"' -f 2 | cut -d':' -f 2))
+  local ref=$(tail -f "${registry_output}" | head -1)
+  "${DOCKER}" pull "${ref}"
+  kill "${registry_pid}"
 
-  LEGACY_COUNT=$((${#TOTAL_DIFF_IDS[@]} - ${#NEW_DIFF_IDS[@]}))
-  echo "${TOTAL_DIFF_IDS[@]:0:${LEGACY_COUNT}}"
-}
-
-function import_config() {
-  # Create an image from the image configuration file.
-  local name="${RUNFILES}/$1"
-  shift 1
-
-  local tmp_dir="$(mktemp -d)"
-  echo "${tmp_dir}" >> "${TEMP_FILES}"
-
-  cd "${tmp_dir}"
-
-  # Docker elides layer reads from the tarball when it
-  # already has a copy of the layer with the same basis
-  # as it has within the tarball.  This means that once
-  # we have found the lowest layer in our image of which
-  # Docker is unaware we must load all of the remaining
-  # layers.  So to determine existence, iterate through
-  # the layers attempting to load the image without it's
-  # tarball.  As soon as one fails, break and synthesize
-  # a "docker save" tarball of all of the remaining layers.
-
-  # Find the cut-off point of layers we may
-  # already know about, and setup out arrays.
-  DIFF_IDS=()
-  ALL_QUOTED=()
-  for diff_id in $(find_diffbase "${name}" "$@");
-  do
-    DIFF_IDS+=("\"sha256:${diff_id}\"")
-    ALL_QUOTED+=("\"${diff_id}.tar\"")
-  done
-
-  # Starting from our legacy diffbase, figure out which
-  # additional layers the Docker daemon already has.
-  while test $# -gt 0
-  do
-    local diff_id="$(cat "${RUNFILES}/$1")"
-    local layer="${RUNFILES}/$2"
-
-    DIFF_IDS+=("\"sha256:${diff_id}\"")
-
-    if ! sequence_exists "${DIFF_IDS[@]}"; then
-      # This sequence of diff-ids has not been seen,
-      # so we must start by making this layer part of
-      # the tarball we load.
-      break
-    fi
-
-    ALL_QUOTED+=("\"${diff_id}.tar\"")
-    shift 2
-  done
-
-  # Set up the list of layers we actually need to load,
-  # from the cut-off established above.
-  MISSING=()
-  while test $# -gt 0
-  do
-    local diff_id="$(cat "${RUNFILES}/$1")"
-    local layer="${RUNFILES}/$2"
-    shift 2
-
-    ALL_QUOTED+=("\"${diff_id}.tar\"")
-
-    # Only create the link if it doesn't exist.
-    # Only add files to MISSING once.
-    if [ ! -f "${diff_id}.tar" ]; then
-      ln -s "${layer}" "${diff_id}.tar"
-      MISSING+=("${diff_id}.tar")
-    fi
-  done
-
-  cp "${name}" config.json
-  cat > manifest.json <<EOF
-[{
-   "Config": "config.json",
-   "Layers": [$(join_by , ${ALL_QUOTED[@]})],
-   "RepoTags": []
-}]
-EOF
-
-  MISSING+=("config.json" "manifest.json")
-
-  # We minimize reads / writes by symlinking the layers above
-  # and then streaming exactly the layers we've established are
-  # needed into the Docker daemon.
-  tar cPh "${MISSING[@]}" | "${DOCKER}" ${DOCKER_FLAGS} load
-}
-
-function tag_layer() {
-  local name="$(cat "${RUNFILES}/$2")"
-
-  local TAG="$1"
-  echo "Tagging ${name} as ${TAG}"
-  "${DOCKER}" ${DOCKER_FLAGS} tag sha256:${name} ${TAG}
+  "${DOCKER}" tag "${ref}" "${TAG}"
+  "${DOCKER}" rmi "${ref}"
 }
 
 function read_variables() {
@@ -240,10 +123,6 @@ function read_variables() {
 # List of 'import_config' statements for all images.
 # This generated and injected by docker_*.
 %{load_statements}
-
-# List of 'tag_layer' statements for all tags.
-# This generated and injected by docker_*.
-%{tag_statements}
 
 # An optional "docker run" statement for invoking a loaded container.
 # This is not executed if the single argument --norun is passed or

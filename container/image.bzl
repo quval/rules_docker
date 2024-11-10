@@ -553,6 +553,8 @@ def _impl(
     runfiles = ctx.runfiles(
         files = unzipped_layers + diff_ids + [config_file, config_digest, output_config_digest] +
                 ([container_parts["legacy"]] if container_parts["legacy"] else []),
+    ).merge(
+        ctx.attr._registry_tool[DefaultInfo].default_runfiles,
     )
 
     return [

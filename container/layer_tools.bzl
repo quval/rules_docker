@@ -259,8 +259,13 @@ def incremental_load(
 
         # Import the config and the subset of layers not present
         # in the daemon.
+        tag_reference = tag if not stamp else tag.replace("{", "${")
         load_statements.append(
-            "import_config '%s' %s" % (
+            "import_config \"%s\" '%s' %s" % (
+                # Turn stamp variable references into bash variables.
+                # It is notable that the only legal use of '{' in a
+                # tag would be for stamp variables, '$' is not allowed.
+                tag_reference,
                 _get_runfile_path(ctx, image["config"]),
                 " ".join([
                     "'%s' '%s'" % (
@@ -272,24 +277,13 @@ def incremental_load(
             ),
         )
 
-        # Now tag the imported config with the specified tag.
-        tag_reference = tag if not stamp else tag.replace("{", "${")
-        tag_statements.append(
-            "tag_layer \"%s\" '%s'" % (
-                # Turn stamp variable references into bash variables.
-                # It is notable that the only legal use of '{' in a
-                # tag would be for stamp variables, '$' is not allowed.
-                tag_reference,
-                _get_runfile_path(ctx, image["config_digest"]),
-            ),
-        )
-
     ctx.actions.expand_template(
         template = ctx.file.incremental_load_template,
         substitutions = {
             "%{docker_flags}": " ".join(toolchain_info.docker_flags),
             "%{docker_tool_path}": docker_path(toolchain_info),
             "%{load_statements}": "\n".join(load_statements),
+            "%{registry_tool}": _get_runfile_path(ctx, ctx.executable._registry_tool),
             "%{run_statement}": run_statement,
             "%{run_tag}": run_tag,
             "%{run}": str(run),
@@ -319,6 +313,11 @@ tools = {
     ),
     "_join_layers": attr.label(
         default = Label("//container/go/cmd/join_layers"),
+        cfg = "exec",
+        executable = True,
+    ),
+    "_registry_tool": attr.label(
+        default = Label("//container:registry_tool"),
         cfg = "exec",
         executable = True,
     ),

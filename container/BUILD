@@ -50,6 +50,12 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+py_binary(
+    name = "registry_tool",
+    srcs = ["registry_tool.py"],
+    deps = ["@bazel_tools//tools/python/runfiles"]
+)
+
 bzl_library(
     name = "bundle",
     srcs = ["bundle.bzl"],
